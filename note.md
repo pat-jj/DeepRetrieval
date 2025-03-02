@@ -1,0 +1,1 @@
+https://msmarco.z22.web.core.windows.net/msmarcoranking/qrels.dev.tsv
