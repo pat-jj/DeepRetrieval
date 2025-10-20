@@ -24,6 +24,8 @@ import torch.distributed
 import verl.utils.hdfs_io as hdfs_io
 import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, open_dict
+from peft import LoraConfig, TaskType, get_peft_model
+
 from verl import DataProto
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import register, Dispatch
@@ -31,10 +33,13 @@ from verl.utils import hf_tokenizer
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy, offload_fsdp_grad, init_fn, get_init_weight_context_manager
-from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and_grad, load_fsdp_optimizer, \
+from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and_grad, load_fsdp_optimizer,  collect_lora_params, layered_summon_lora_params, replace_lora_wrapper,\
     load_fsdp_param_and_grad
+from verl.utils.py_functional import convert_to_regular_types
+
+
 from verl.utils.import_utils import import_external_libs
-from verl.utils.model import compute_position_id_with_mask
+from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.flops_counter import FlopsCounter
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
@@ -43,6 +48,18 @@ from codetiming import Timer
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
+#Added by Zilal
+def get_vl_model_vision_tower(vl_model_instance):
+    """
+    Util to extract Vision Tower from a VL model instance
+    """
+    if hasattr(vl_model_instance, "model") and hasattr(vl_model_instance.model, "visual"):
+        # transformers >= 4.52.0
+        return vl_model_instance.model.visual
+    elif hasattr(vl_model_instance, "visual"):
+        # transformers < 4.52.0
+        return vl_model_instance.visual
+    return None
 
 class ActorRolloutRefWorker(Worker):
     """
@@ -73,6 +90,10 @@ class ActorRolloutRefWorker(Worker):
                                                         mesh_dim_names=['dp', 'sp'])
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+        #Added by Zilal for LoRA
+        self._lora_rank = self.config.model.get("lora_rank", 0)
+        self._is_lora = self._lora_rank > 0
+        #Ended Zilal
 
         self.role = role
         assert self.role in ['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']
@@ -171,6 +192,34 @@ class ActorRolloutRefWorker(Worker):
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+            #Started by Zilal for LoRA
+            if self._is_lora:
+                print("Applying LoRA to actor module")
+                actor_module.enable_input_require_grads()
+                # Convert config to regular Python types before creating PEFT model
+                lora_config = {
+                    "task_type": TaskType.CAUSAL_LM,
+                    "r": self.config.model.lora_rank,
+                    "lora_alpha": self.config.model.lora_alpha,
+                    "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                    "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
+                    "bias": "none",
+                }
+                actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+        self.use_orig_params = fsdp_config.get("use_orig_params", False)
+        if self.config.actor.get("freeze_vision_tower", False):
+            vision_tower = get_vl_model_vision_tower(actor_module)
+            if vision_tower is not None:
+                vision_tower.requires_grad_(False)
+                self.use_orig_params = True
+                if self.rank == 0:
+                    print("[actor model] Vision tower is set to not trainable.")
+            else:
+                if self.rank == 0:
+                    print("[actor model] No vision tower found.")
+        # Ended Zilal
+            
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -194,7 +243,10 @@ class ActorRolloutRefWorker(Worker):
         if self._is_ref:
             mixed_precision = None
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None))
+        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None),
+                                                #Added by Zilal
+                                                is_lora=self.config.model.get("lora_rank", 0) > 0,
+                                                )
 
         if self._is_rollout and self.config.rollout.name == 'hf':
             # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
@@ -278,8 +330,123 @@ class ActorRolloutRefWorker(Worker):
                                                                full_params='hf' in self.config.rollout.load_format,
                                                                device_mesh=rollout_device_mesh)
             log_gpu_memory_usage('After building sharding manager', logger=None)
+        
+        #Added by Zilal for LoRA
+        # ---- LoRA-related flags only (no weight pushes here) ----
+
+        # used for LoRA
+        self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
+        self.layered_summon = self.config.rollout.get("layered_summon", False)
+        
+    
+        #Ended Zilal
 
         return rollout, rollout_sharding_manager
+    
+    #Added by Zilal
+    async def rollout_mode(self):
+    # Bring params to GPU if they were offloaded
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            
+    # --- LoRA: collect params (adapters or full) ---
+
+            
+        peft_config = None
+        peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        if hasattr(peft_model, "peft_config"):  # LoRA
+            peft_config = peft_model.peft_config.get("default", None)
+            params = collect_lora_params(
+                module=self.actor_module_fsdp,
+                layered_summon=self.config.rollout.get("layered_summon", False),
+                base_sync_done=self.base_sync_done,
+            )
+            if not self.base_sync_done:
+                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+        else:
+            params = self.actor_module_fsdp.state_dict()
+        
+        params = convert_weight_keys(
+            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        )
+        
+        # Special handling for LoRA with sleep_level=2:
+        # When sleep_level=2, base model weights are destroyed during each sleep cycle.
+        # separately collect and update LoRA weights and base model weights through their respective interfaces.
+        # Here: params contains LoRA weights, base_model_params contains base model weights.
+        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
+            base_model_params = collect_lora_params(
+                module=self.actor_module_fsdp,
+                layered_summon=self.layered_summon,
+                base_sync_done=False,
+            )
+            base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
+            base_model_params = convert_weight_keys(
+                base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            )
+        log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
+
+        set_expandable_segments(False)
+
+        if peft_config is not None and self.base_sync_done:
+            per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
+        else:
+            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+            per_tensor_param = (
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                for name, param in params.items()
+            )
+        
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["weights"])
+        log_gpu_memory_usage("After resume weights", logger=logger)
+
+        # Push base weights first if sleep_level=2
+        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
+            per_tensor_base_params = (
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                for name, param in base_model_params.items()
+            )
+            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+            del base_model_params, per_tensor_base_params
+
+        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        log_gpu_memory_usage("After update_weights", logger=logger)
+        del params, per_tensor_param
+        aggressive_empty_cache(force_sync=True)
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["kv_cache"])
+        log_gpu_memory_usage("After resume kv_cache", logger=logger)
+        
+        
+        self.base_sync_done = True
+        # important: need to manually set the random states of each tp to be identical.
+        self.torch_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.gen_random_states)
+
+    async def trainer_mode(self):
+        """Context switch hybridengine to trainer mode."""
+        if self.config.rollout.free_cache_engine:
+            log_gpu_memory_usage("Before rollout offload", logger=logger)
+            await self.rollout.release()
+            log_gpu_memory_usage("After rollout offload", logger=logger)
+
+        self.actor_module_fsdp.train()
+        
+        # add empty cache after each compute
+        aggressive_empty_cache(force_sync=True)
+
+        set_expandable_segments(True)
+
+        # restore random states
+        self.gen_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.torch_random_states)
+        
+        #Ended Zilal
+      
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -399,51 +566,140 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
-        prompts = prompts.to('cuda')
+        # prompts = prompts.to('cuda') #By Zilal
+        prompts = prompts.to(get_device_id()) #By Zilal
         # set to False if it is validation
-        recompute_log_prob = prompts.meta_info.get('recompute_log_prob', True)
+        recompute_log_prob = prompts.meta_info.get('recompute_log_prob', True) 
 
         assert self._is_rollout
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
-
-        prompts.batch = prompts.batch.cuda()
-        meta_info = {'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id}
+        # Added by Zilal
+        # Pass EOS/PAD from generation_config if present
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id
+            if self.generation_config is not None
+            else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id
+            if self.generation_config is not None
+            else self.tokenizer.pad_token_id,
+        }
+        #Ended
+        # prompts.batch = prompts.batch.cuda() #By Zilal
+        # meta_info = {'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id} #By Zilal
         prompts.meta_info.update(meta_info)
-        with self.rollout_sharding_manager:
-            log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+        
+        #Added by Zilal
+        # Preserve LoRA flag (don’t pop later)
+        is_lora = prompts.meta_info.get("is_lora", False)
+        
+        #Added by Zilal
+        timing_generate = {} # Add timing metrics
+        '''
+        This is especially important with LoRA + offloading; 
+        it ensures adapters/weights are synchronized and RNG states are handled.
+        '''
+        if self._is_actor:  # For rollout only, we do not switch context.
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.rollout_mode())
+            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+        with simple_timer("generate_sequences", timing_generate):
+            if getattr(self, "rollout_sharding_manager", None) is not None:
+            # Use the sharding manager path (e.g., vLLM + FSDPVLLMShardingManager)
+                with self.rollout_sharding_manager:
+                    log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
+                    prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+                    output = self.rollout.generate_sequences(prompts=prompts)
+                    log_gpu_memory_usage("After rollout generation", logger=logger)
+                    output = self.rollout_sharding_manager.postprocess_data(output)
+        else:
             output = self.rollout.generate_sequences(prompts=prompts)
 
-            log_gpu_memory_usage('After rollout generation', logger=logger)
-
-            output = self.rollout_sharding_manager.postprocess_data(output)
-
+        if self._is_actor:
+            loop.run_until_complete(self.trainer_mode())
+            log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+        #Ended by Zilal
+        
+        
+    
         if self._is_actor and recompute_log_prob:
+            #Added by Zilal
+            from contextlib import nullcontext
+            adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+            #Ended
+            
             # we should always recompute old_log_probs when it is HybridEngine
             output.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
             output.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
             output.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
             output.meta_info['temperature'] = self.config.rollout.temperature
+            # Also pass the flag forward (non-destructively)
+            output.meta_info["is_lora"] = is_lora #By Zilal
             # perform recompute log_prob
-            with self.ulysses_sharding_manager:
+            with self.ulysses_sharding_manager, adapter_ctx: #By Zilal
+            # with self.ulysses_sharding_manager: #By Zilal
                 output = self.ulysses_sharding_manager.preprocess_data(output)
                 old_log_probs = self.actor.compute_log_prob(data=output)
                 output.batch['old_log_probs'] = old_log_probs
                 output = self.ulysses_sharding_manager.postprocess_data(output)
 
-        output = output.to('cpu')
-
+      
+        # Now it’s safe to offload again #ZAdded By ilal
         if self._is_offload_param:
-            # NOTE(sgm): the grad is already in CPU, only offload param here
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+            offload_fsdp_param_and_grad(self.actor_module_fsdp, offload_grad=self._is_offload_grad)
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
+            
+    
+        #Added by Zilal
+        # We calculate the average timing across all ranks
+        # to make sure meta_info["timing"] is the same
+        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
+            timing_generate["generate_sequences"]
+        )
+        timing_generate = reduce_timing(timing_generate)
+        timing_generate.update(
+            {
+                "generation_timing/max": timing_generate_max,
+                "generation_timing/min": timing_generate_min,
+                "generation_timing/topk_ratio": timing_generate_topk_ratio,
+            }
+        )
+        output.meta_info["timing"] = timing_generate
+        output = output.to("cpu")
+        
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        # clear kv cache
+        get_torch_device().empty_cache()
         return output
+        #Ended by Zilal
+        
+        #Commented by Zilal
+        # with self.rollout_sharding_manager:
+        #     log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+
+        #     prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+        #     output = self.rollout.generate_sequences(prompts=prompts)
+
+        #     log_gpu_memory_usage('After rollout generation', logger=logger)
+
+        #     output = self.rollout_sharding_manager.postprocess_data(output)
+
+
+       
+        # return output
+        
+        #End of comment by Zilal
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
@@ -615,12 +871,37 @@ class CriticWorker(Worker):
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=critic_module, config=self.config.model.fsdp_config.wrap_policy)
+        auto_wrap_policy = get_fsdp_wrap_policy(module=critic_module, config=self.config.model.fsdp_config.wrap_policy,
+                                                #Added by Zilal
+                                                is_lora=self.config.model.get("lora_rank", 0) > 0,
+                                                )
 
         log_gpu_memory_usage('Before critic FSDP', logger=None)
+        
+        #Added by Zilal
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
+        self.use_orig_params = fsdp_config.get("use_orig_params", False)
+        if self.config.model.get("freeze_vision_tower", False):
+            vision_tower = get_vl_model_vision_tower(critic_module)
+            if vision_tower is not None:
+                vision_tower.requires_grad_(False)
+                self.use_orig_params = True
+                if self.rank == 0:
+                    print("[critic model] Vision tower is set to not trainable.")
+                else:
+                    if self.rank == 0:
+                        print("[critic model] No vision tower found.")
+        #Ended Zilal
         critic_module = FSDP(critic_module,
                              param_init_fn=init_fn,
+                             #By Zilal
+                             use_orig_params=self.use_orig_params,
+                             device_mesh=self.device_mesh,
+                             cpu_offload=None,
+                             #Ended
+
                              use_orig_params=False,
                              auto_wrap_policy=auto_wrap_policy,
                              device_id=torch.cuda.current_device(),

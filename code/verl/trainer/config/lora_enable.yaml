@@ -1,0 +1,18 @@
+actor_rollout_ref:
+  model:
+    # LoRA ON when rank > 0
+    lora_rank: 32
+    lora_alpha: 32
+    lora_dropout: 0.05
+    # For Llama/Mistral-style models, this list is safe:
+    target_modules: ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
+  actor:
+    optim:
+      # LoRA tolerates higher LR than full FT
+      lr: 3e-5
+
+# (Optional) If you keep using vLLM for rollout with adapters,
+# switch the load format and thread adapter paths through your code.
+actor_rollout_ref:
+  rollout:
+    load_format: safetensors   # instead of dummy_dtensor when serving LoRA via vLLM

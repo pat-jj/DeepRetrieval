@@ -330,3 +330,24 @@ def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batc
         max_seqlen_in_batch = max(max_seqlen_in_batch, pad_size)
 
     return unpad_tokens, cu_seqlens, max_seqlen_in_batch
+
+#Added by Zilal
+def convert_weight_keys(state_dict: dict[str, torch.Tensor], model: PreTrainedModel):
+    # convert state dict keys: https://github.com/huggingface/transformers/pull/38385
+    if not hasattr(model, "_checkpoint_conversion_mapping"):
+        return state_dict
+
+    reverse_key_mapping = {v: k for k, v in model._checkpoint_conversion_mapping.items()}
+    original_weights = {}
+    for key, value in state_dict.items():
+        for pattern, replacement in reverse_key_mapping.items():
+            replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
+            replacement = re.sub(r"\(.*\)", "", replacement)
+            key, n_replace = re.subn(pattern, replacement, key)
+            # Early exit of the loop
+            if n_replace > 0:
+                break
+
+        original_weights[key] = value
+
+    return original_weights
