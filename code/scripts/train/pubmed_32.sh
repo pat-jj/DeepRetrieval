@@ -35,4 +35,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=pubmed_search_32 \
     actor_rollout_ref.model.path=meta-llama/Llama-3.2-3B-Instruct \
     critic.model.path=meta-llama/Llama-3.2-3B-Instruct \
-    trainer.total_epochs=10 2>&1 | tee exp_log/32-ppo-verl_demo_$DATE.log 
+    trainer.total_epochs=10 2>&1 | tee exp_log/32-ppo-verl_demo_$DATE.log \
+    

@@ -48,3 +48,4 @@ code/zilal_contribution/slurm_jobs/logs/
 
 # other
 *.key
+zilal_contribution/slurm_jobs/logs/

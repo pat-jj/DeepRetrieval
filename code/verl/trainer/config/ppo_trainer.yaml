@@ -18,6 +18,20 @@ actor_rollout_ref:
     override_config: { }
     enable_gradient_checkpointing: False
     use_remove_padding: False
+    # Added by Zilal 
+    # >>> LoRA settings for the actor <<<
+    lora_rank: 16           # >0 turns LoRA on
+    lora_alpha: 32
+    target_modules:         # Llama/Mistral-style names
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    exclude_modules: []     # optional
+    #Ended by Zilal
   actor:
     strategy: fsdp  # This is for backward-compatibility
     ppo_mini_batch_size: 256
@@ -98,6 +112,20 @@ critic:
     external_lib: ${actor_rollout_ref.model.external_lib}
     enable_gradient_checkpointing: False
     use_remove_padding: False
+    #Added by Zilal
+    # >>> LoRA settings for the critic (optional) <<<
+    lora_rank: 16
+    lora_alpha: 32
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    exclude_modules: []
+    #ended by Zilal
     fsdp_config:
       param_offload: False
       grad_offload: False

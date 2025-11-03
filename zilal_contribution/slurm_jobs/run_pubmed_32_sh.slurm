@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --partition=IllinoisComputes-GPU
 #SBATCH --account=jimeng-ic
-#SBATCH --job-name=eval_pubmed_32
-#SBATCH --output=logs/eval_pubmed_32_%j.out
-#SBATCH --error=logs/eval_pubmed_32_%j.err
-#SBATCH --gres=gpu:A100:1
+#SBATCH --job-name=lora_pubmed_32
+#SBATCH --output=logs/lora_pubmed_32_%j.out
+#SBATCH --error=logs/lora_pubmed_32_%j.err
+#SBATCH --gres=gpu:H200:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=3-00:00:00
@@ -22,8 +22,9 @@ module load cuda/12.6
 # --- Activate conda environment ---
 source ~/miniconda/etc/profile.d/conda.sh  # adjust if different
 conda activate zero
+pip install omegaconf 
 
-cd /projects/illinois/eng/cs/jimeng/zelalae2/scratch/testDeepRetrieval/DeepRetrieval/code/
+cd /projects/illinois/eng/cs/jimeng/zelalae2/scratch/DeepRetrieval/code/
 
 # --- Diagnostic Info ---
 echo "=== GPU Info (nvidia-smi) ==="
