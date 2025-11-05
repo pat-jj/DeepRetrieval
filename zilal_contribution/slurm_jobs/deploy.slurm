@@ -4,7 +4,7 @@
 #SBATCH --job-name=deploy
 #SBATCH --output=logs/deploy_%j.out
 #SBATCH --error=logs/deploy_%j.err
-#SBATCH --gres=gpu:A100:2
+#SBATCH --gres=gpu:H200:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=3-00:00:00
@@ -21,18 +21,8 @@ echo "=========================================="
 source /projects/illinois/eng/cs/jimeng/zelalae2/miniconda/etc/profile.d/conda.sh # adjust if different
 
 conda activate zero
-# pip install pyairports
-python - <<'PY'
-import sys
-print(sys.executable)
-try:
-    import pyairports
-    print("✅ pyairports loaded correctly")
-except Exception as e:
-    print("❌ Import failed:", e)
-PY
-# pip install "uvicorn[standard]>=0.27,<1" "fastapi>=0.103,<1" "starlette>=0.40,<0.50" \
-#             "pydantic>=2.9,<3" "anyio<5,>=3.5" "aiohttp>=3.9,<4"
+
+
 cd /projects/illinois/eng/cs/jimeng/zelalae2/scratch/original_deepRetrieval/DeepRetrieval
 
 # --- Run your actual script ---

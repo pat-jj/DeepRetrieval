@@ -29,8 +29,12 @@ protobuf
 pydantic>=2.9
 sentencepiece
 tiktoken>=0.6.0
-uvicorn[standard]
 xformers==0.0.27.post2
 mistral-common[opencv]>=1.4.4
 
-pyairports
+uvicorn[standard]>=0.27,<1
+fastapi>=0.103,<1
+starlette>=0.40,<0.50
+pydantic>=2.9,<3
+anyio<5,>=3.5
+aiohttp>=3.9,<4

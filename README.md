@@ -270,7 +270,6 @@ pip install pyparsing decorator bitsandbytes
 
 You may also encounter NumPy incompatibility warnings like:
 ```
-pyhealth 1.1.4 requires numpy<2.0, but you have numpy 2.0.2 which is incompatible.
 outlines 0.0.46 requires numpy<2.0.0, but you have numpy 2.0.2 which is incompatible.
 vllm 0.6.3 requires numpy<2.0.0, but you have numpy 2.0.2 which is incompatible.
 ```
@@ -283,6 +282,21 @@ pip install vllm==0.6.3
 pip install verl==0.1
 pip install outlines==0.0.46
 pip install pyserini
+pip install --no-build-isolation --no-cache-dir "flash-attn==2.6.3"
+pip install "uvicorn[standard]>=0.27,<1" "fastapi>=0.103,<1" "starlette>=0.40,<0.50" \
+            "pydantic>=2.9,<3" "anyio<5,>=3.5" "aiohttp>=3.9,<4"
+
+```
+
+#Deployment issues
+You may see this error after running vllm_host.sh
+```
+Error: API request failed: 500 Server Error: Internal Server Error for url: http://localhost:8000/v1/chat/completions
+```
+Check the log_out to trace the error. In our case, it was related to Import failed: No module named 'pyairports'. 
+To install pyairports:
+```bash
+pip install git+https://github.com/NICTA/pyairports.git
 
 ```
 </details>
